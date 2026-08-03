@@ -60,6 +60,7 @@ default = ["rustls-tls"]
 rustls-tls = ["dep:tokio-rustls", "dep:rustls", "tokio-tungstenite/rustls-tls-webpki-roots"]
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "test-util"] }
 tokio-test = "0.4"
 
