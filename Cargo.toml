@@ -1,6 +1,6 @@
 [package]
 name = "armature-websocket"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.94.1"
 authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
@@ -13,7 +13,7 @@ categories = ["network-programming", "asynchronous", "web-programming"]
 
 [dependencies]
 # Logging
-armature-log = { version = "0" }
+armature-log = { version = "0.2" }
 
 # WebSocket
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake"] }
