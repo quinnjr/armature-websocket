@@ -53,7 +53,7 @@ url = "2.5"
 # Optional: Rustls support
 # TLS is rustls-only per AGENTS.md; no native-tls path is offered.
 tokio-rustls = { version = "0.26", optional = true }
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23.45", optional = true }
 
 [features]
 default = ["rustls-tls"]

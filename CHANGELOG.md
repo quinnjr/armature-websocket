@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Security
+
+- Require `rustls` 0.23.45 or later, which fixes RUSTSEC-2026-0285 (TLS 1.3 handshake messages accepted across encryption-level boundaries).
+
 ### Fixed
 
 - **Breaking:** `From<Message> for tungstenite::Message` becomes `TryFrom`. A hand-built Text frame with a non-UTF-8 payload was lossily converted, silently corrupting it with replacement characters.
