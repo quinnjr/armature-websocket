@@ -1,5 +1,6 @@
 //! WebSocket connection management.
 
+use crate::auth::Principal;
 use crate::error::{WebSocketError, WebSocketResult};
 use crate::message::Message;
 use futures_util::SinkExt;
@@ -8,7 +9,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_tungstenite::WebSocketStream;
 
 /// Unique identifier for a connection.
@@ -36,8 +37,13 @@ pub struct Connection {
     pub remote_addr: Option<SocketAddr>,
     /// Connection state
     state: Arc<RwLock<ConnectionState>>,
-    /// Sender for outgoing messages
-    tx: mpsc::UnboundedSender<Message>,
+    /// Authenticated identity established at upgrade time
+    principal: Arc<Principal>,
+    /// Sender for outgoing messages (bounded: see [`Connection::send`])
+    tx: mpsc::Sender<Message>,
+    /// Wakes the server's read loop when the connection must be torn down
+    /// without the peer's cooperation (slow consumer eviction).
+    evict: Arc<Notify>,
 }
 
 impl Connection {
@@ -45,14 +51,23 @@ impl Connection {
     pub(crate) fn new(
         id: ConnectionId,
         remote_addr: Option<SocketAddr>,
-        tx: mpsc::UnboundedSender<Message>,
+        principal: Arc<Principal>,
+        tx: mpsc::Sender<Message>,
     ) -> Self {
         Self {
             id,
             remote_addr,
             state: Arc::new(RwLock::new(ConnectionState::Open)),
+            principal,
             tx,
+            evict: Arc::new(Notify::new()),
         }
+    }
+
+    /// The identity the [`HandshakeAuthorizer`](crate::HandshakeAuthorizer)
+    /// established for this connection.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
     }
 
     /// Get the connection state.
@@ -65,14 +80,28 @@ impl Connection {
         self.state() == ConnectionState::Open
     }
 
-    /// Send a message to this connection.
+    /// Queue a message for this connection.
+    ///
+    /// Never blocks. The per-connection outbound queue is bounded
+    /// ([`WebSocketServerConfig::outbound_queue_capacity`](crate::WebSocketServerConfig));
+    /// if it is full the peer is not reading fast enough, so instead of
+    /// buffering without limit (or stalling a room broadcast on one slow
+    /// member) the connection is evicted: it moves to
+    /// [`ConnectionState::Closing`], the server tears it down, and this call
+    /// returns [`WebSocketError::SlowConsumer`].
     pub fn send(&self, message: Message) -> WebSocketResult<()> {
         if !self.is_open() {
             return Err(WebSocketError::ConnectionClosed);
         }
-        self.tx
-            .send(message)
-            .map_err(|e| WebSocketError::Send(e.to_string()))
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(connection_id = %self.id, "Outbound queue full; evicting slow consumer");
+                self.evict();
+                Err(WebSocketError::SlowConsumer)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(WebSocketError::ConnectionClosed),
+        }
     }
 
     /// Send a text message.
@@ -92,9 +121,26 @@ impl Connection {
     }
 
     /// Close the connection.
+    ///
+    /// Queues a Close frame; if the queue is full the connection is evicted
+    /// instead, so a close request is never silently lost.
     pub fn close(&self) {
         *self.state.write() = ConnectionState::Closing;
-        let _ = self.tx.send(Message::close());
+        if self.tx.try_send(Message::close()).is_err() {
+            self.evict.notify_one();
+        }
+    }
+
+    /// Mark the connection closing and wake the server's read loop so it
+    /// tears the connection down.
+    fn evict(&self) {
+        *self.state.write() = ConnectionState::Closing;
+        self.evict.notify_one();
+    }
+
+    /// Resolves once the connection has been evicted (see [`Self::send`]).
+    pub(crate) async fn evicted(&self) {
+        self.evict.notified().await;
     }
 
     /// Set the connection state (internal use).
@@ -114,7 +160,9 @@ impl Clone for Connection {
             id: self.id.clone(),
             remote_addr: self.remote_addr,
             state: Arc::clone(&self.state),
+            principal: Arc::clone(&self.principal),
             tx: self.tx.clone(),
+            evict: Arc::clone(&self.evict),
         }
     }
 }
@@ -122,14 +170,14 @@ impl Clone for Connection {
 /// Manages the write side of a WebSocket connection.
 pub(crate) struct ConnectionWriter {
     sink: SplitSink<WebSocketStream<TcpStream>, tungstenite::Message>,
-    rx: mpsc::UnboundedReceiver<Message>,
+    rx: mpsc::Receiver<Message>,
 }
 
 impl ConnectionWriter {
     /// Create a new connection writer.
     pub fn new(
         sink: SplitSink<WebSocketStream<TcpStream>, tungstenite::Message>,
-        rx: mpsc::UnboundedReceiver<Message>,
+        rx: mpsc::Receiver<Message>,
     ) -> Self {
         Self { sink, rx }
     }
