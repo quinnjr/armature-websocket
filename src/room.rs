@@ -270,11 +270,51 @@ impl Default for RoomManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Principal;
     use tokio::sync::mpsc;
 
-    fn make_connection(id: &str) -> (Connection, mpsc::UnboundedReceiver<Message>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        (Connection::new(id.to_string(), None, tx), rx)
+    fn make_connection(id: &str) -> (Connection, mpsc::Receiver<Message>) {
+        make_bounded_connection(id, 64)
+    }
+
+    fn make_bounded_connection(id: &str, capacity: usize) -> (Connection, mpsc::Receiver<Message>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (
+            Connection::new(id.to_string(), None, Arc::new(Principal::anonymous()), tx),
+            rx,
+        )
+    }
+
+    /// A member that stops draining its queue must not make broadcast block
+    /// or buffer without limit: once its bounded queue is full it is evicted
+    /// (moved to `Closing`) and no longer counted, while healthy members keep
+    /// receiving.
+    #[test]
+    fn broadcast_evicts_slow_consumer_instead_of_buffering() {
+        let manager = RoomManager::new();
+        let (slow, _slow_rx) = make_bounded_connection("slow", 2);
+        let (fast, mut fast_rx) = make_bounded_connection("fast", 64);
+        manager.register_connection(slow.clone());
+        manager.register_connection(fast);
+        manager.join_room("slow", "r").unwrap();
+        manager.join_room("fast", "r").unwrap();
+
+        let mut counts = Vec::new();
+        for i in 0..5 {
+            counts.push(
+                manager
+                    .broadcast_to_room("r", Message::text(format!("{i}")))
+                    .unwrap(),
+            );
+            while fast_rx.try_recv().is_ok() {}
+        }
+
+        assert_eq!(counts, vec![2, 2, 1, 1, 1]);
+        assert_eq!(slow.state(), crate::connection::ConnectionState::Closing);
+        assert!(matches!(
+            slow.send(Message::text("x")),
+            Err(WebSocketError::ConnectionClosed)
+        ));
     }
 
     #[test]
