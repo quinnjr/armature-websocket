@@ -38,6 +38,11 @@ pub enum WebSocketError {
     #[error("Failed to send message: {0}")]
     Send(String),
 
+    /// The peer did not drain its outbound queue fast enough and the
+    /// connection was evicted.
+    #[error("Slow consumer: outbound queue full, connection evicted")]
+    SlowConsumer,
+
     /// Timeout error
     #[error("Operation timed out")]
     Timeout,

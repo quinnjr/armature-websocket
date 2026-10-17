@@ -14,11 +14,47 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 /// Builder for WebSocket client.
-#[derive(Debug, Clone)]
+///
+/// `Debug` output redacts URL userinfo and the query string, which commonly
+/// carry credentials or access tokens.
+#[derive(Clone)]
 pub struct WebSocketClientBuilder {
     url: Option<String>,
     connect_timeout: Duration,
     max_message_size: Option<usize>,
+    inbound_queue_capacity: usize,
+}
+
+/// Default capacity (in messages) of the client's inbound queue.
+const DEFAULT_INBOUND_QUEUE_CAPACITY: usize = 1024;
+
+impl std::fmt::Debug for WebSocketClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebSocketClientBuilder")
+            .field("url", &self.url.as_deref().map(redact_url))
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_message_size", &self.max_message_size)
+            .field("inbound_queue_capacity", &self.inbound_queue_capacity)
+            .finish()
+    }
+}
+
+/// Render a URL with userinfo and query string replaced by `[REDACTED]`.
+fn redact_url(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(mut url) => {
+            if !url.username().is_empty() || url.password().is_some() {
+                let _ = url.set_username("[REDACTED]");
+                let _ = url.set_password(None);
+            }
+            if url.query().is_some() {
+                url.set_query(Some("[REDACTED]"));
+            }
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => "[unparseable URL]".to_string(),
+    }
 }
 
 impl Default for WebSocketClientBuilder {
@@ -27,6 +63,7 @@ impl Default for WebSocketClientBuilder {
             url: None,
             connect_timeout: Duration::from_secs(30),
             max_message_size: None,
+            inbound_queue_capacity: DEFAULT_INBOUND_QUEUE_CAPACITY,
         }
     }
 }
@@ -55,21 +92,40 @@ impl WebSocketClientBuilder {
         self
     }
 
+    /// Set the capacity (in messages, default 1024) of the inbound queue
+    /// between the socket reader and [`WebSocketClient::recv`].
+    ///
+    /// When the queue is full the reader stops reading from the socket until
+    /// the application calls `recv`, so a server that sends faster than the
+    /// application consumes is throttled by TCP flow control (backpressure)
+    /// instead of growing client memory without limit. No message is dropped.
+    /// Must be non-zero.
+    pub fn inbound_queue_capacity(mut self, capacity: usize) -> Self {
+        self.inbound_queue_capacity = capacity;
+        self
+    }
+
     /// Connect to the WebSocket server.
     pub async fn connect(self) -> WebSocketResult<WebSocketClient> {
         let url = self
             .url
             .ok_or_else(|| WebSocketError::InvalidUrl("URL not provided".to_string()))?;
 
-        WebSocketClient::connect_with_config(&url, self.connect_timeout, self.max_message_size)
-            .await
+        WebSocketClient::connect_with_config(
+            &url,
+            self.connect_timeout,
+            self.max_message_size,
+            self.inbound_queue_capacity,
+        )
+        .await
     }
 }
 
 /// WebSocket client for connecting to WebSocket servers.
 pub struct WebSocketClient {
     tx: mpsc::UnboundedSender<Message>,
-    rx: mpsc::UnboundedReceiver<Message>,
+    /// Bounded: a full queue pauses the socket reader (backpressure).
+    rx: mpsc::Receiver<Message>,
     /// Thread-safe closed flag using AtomicBool to prevent data races
     /// between send() and close() when client is shared across tasks.
     ///
@@ -92,7 +148,7 @@ impl WebSocketClient {
 
     /// Connect to a WebSocket server with a timeout.
     pub async fn connect_with_timeout(url: &str, timeout: Duration) -> WebSocketResult<Self> {
-        Self::connect_with_config(url, timeout, None).await
+        Self::connect_with_config(url, timeout, None, DEFAULT_INBOUND_QUEUE_CAPACITY).await
     }
 
     /// Connect to a WebSocket server with a timeout and an optional maximum
@@ -104,7 +160,13 @@ impl WebSocketClient {
         url: &str,
         timeout: Duration,
         max_message_size: Option<usize>,
+        inbound_queue_capacity: usize,
     ) -> WebSocketResult<Self> {
+        if inbound_queue_capacity == 0 {
+            return Err(WebSocketError::Connection(
+                "inbound_queue_capacity must be non-zero".to_string(),
+            ));
+        }
         let url = Url::parse(url).map_err(|e| WebSocketError::InvalidUrl(e.to_string()))?;
 
         let ws_config = max_message_size.map(|size| {
@@ -124,7 +186,10 @@ impl WebSocketClient {
 
         // Create channels for sending and receiving messages
         let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Message>();
-        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel::<Message>();
+        // The outgoing queue is fed only by this application, so it stays
+        // unbounded; the incoming one is fed by the remote server and is
+        // bounded (see `inbound_queue_capacity`).
+        let (incoming_tx, incoming_rx) = mpsc::channel::<Message>(inbound_queue_capacity);
 
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -184,6 +249,9 @@ impl WebSocketClient {
 
     /// Reader task that receives messages from the WebSocket.
     ///
+    /// Awaits the bounded inbound queue, so while the application is not
+    /// consuming, the socket is not read and the server is throttled.
+    ///
     /// Marks `closed` when the loop exits for any reason -- a remote close
     /// frame, a read error, or the stream ending -- so `is_closed()`
     /// reflects reality even when nobody explicitly called `close()`.
@@ -193,19 +261,19 @@ impl WebSocketClient {
                 tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
             >,
         >,
-        tx: mpsc::UnboundedSender<Message>,
+        tx: mpsc::Sender<Message>,
         closed: Arc<AtomicBool>,
     ) {
         while let Some(result) = read.next().await {
             match result {
                 Ok(msg) => {
                     if msg.is_close() {
-                        let _ = tx.send(Message::close());
+                        let _ = tx.send(Message::close()).await;
                         break;
                     }
 
                     let message: Message = msg.into();
-                    if tx.send(message).is_err() {
+                    if tx.send(message).await.is_err() {
                         break;
                     }
                 }
@@ -290,6 +358,17 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message as RawMessage;
 
+    #[test]
+    fn builder_debug_redacts_url_credentials_and_query() {
+        let builder =
+            WebSocketClientBuilder::new().url("wss://user:hunter2@api.example/ws?token=sk_secret");
+        let dbg = format!("{builder:?}");
+        assert!(dbg.contains("api.example/ws"));
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+        assert!(!dbg.contains("user:"), "{dbg}");
+        assert!(!dbg.contains("sk_secret"), "{dbg}");
+    }
+
     #[tokio::test]
     async fn is_closed_reflects_remote_close() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -325,6 +404,65 @@ mod tests {
 
         // The receive channel should also wind down.
         let _ = client.recv().await;
+    }
+
+    /// A server that floods the client must not make it buffer without
+    /// limit: the inbound queue holds at most `inbound_queue_capacity`
+    /// messages, the rest stay unread on the socket (backpressure), and all
+    /// of them are still delivered in order once the application consumes.
+    #[tokio::test]
+    async fn inbound_queue_is_bounded_with_lossless_backpressure() {
+        const SENT: usize = 200;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for i in 0..SENT {
+                ws.send(RawMessage::Text(i.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            // Keep the connection open until the client is done.
+            while ws.next().await.is_some() {}
+        });
+
+        let mut client = WebSocketClient::builder()
+            .url(format!("ws://{}", addr))
+            .inbound_queue_capacity(4)
+            .connect()
+            .await
+            .unwrap();
+
+        // Let the server flush everything while the application does not
+        // consume.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            client.rx.len() <= 4,
+            "inbound queue grew past its capacity: {}",
+            client.rx.len()
+        );
+
+        for expected in 0..SENT {
+            let msg = tokio::time::timeout(Duration::from_secs(2), client.recv())
+                .await
+                .expect("timed out waiting for a backpressured message")
+                .expect("stream ended early");
+            assert_eq!(msg.as_text(), Some(expected.to_string().as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_inbound_queue_capacity_is_rejected() {
+        let err = WebSocketClient::builder()
+            .url("ws://127.0.0.1:1")
+            .inbound_queue_capacity(0)
+            .connect()
+            .await
+            .err()
+            .expect("zero capacity must be rejected");
+        assert!(err.to_string().contains("inbound_queue_capacity"));
     }
 
     #[tokio::test]
