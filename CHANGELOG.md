@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - Upgrade requests are authorized before the handshake completes (Cross-Site WebSocket Hijacking): every request passes an `OriginPolicy` (default rejects any request carrying an `Origin` header until origins are allowlisted; requests without `Origin` — non-browser clients — go on to the authorizer) and then a `HandshakeAuthorizer`, whose `Principal` is attached to the connection. Refused upgrades get a plain `401`/`403` response.
